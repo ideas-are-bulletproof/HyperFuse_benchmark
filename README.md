@@ -46,16 +46,6 @@ The benchmark currently has faithful data sources for the following datasets:
 | Mushroom | `mushroom` |
 | NTU2012 | `ntu2012` |
 
-Additional datasets are registered for transparency (`IMDB`, `AMiner`, `DBLP-A`, `DBLP-P`, and `House`), but are skipped unless corresponding data are supplied.
-
-The benchmark expects each dataset in the standard pickle format:
-
-```text
-features.pickle
-hypergraph.pickle
-labels.pickle
-```
-
 The data themselves are **not included in this repository**.
 
 ## Evaluation protocol
