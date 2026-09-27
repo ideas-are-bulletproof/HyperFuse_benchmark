@@ -43,7 +43,6 @@ The benchmark currently has faithful data sources for the following datasets:
 | ModelNet40 | `modelnet40` |
 | Zoo | `zoo` |
 | 20News | `20news` |
-| Mushroom | `mushroom` |
 | NTU2012 | `ntu2012` |
 
 The data themselves are **not included in this repository**.
