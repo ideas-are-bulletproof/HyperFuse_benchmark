@@ -14,10 +14,6 @@ The default unsupervised representation-learning methods are:
 - **VilLain**
 - **HypeBoy**
 
-The repository also contains an adapter for:
-
-- **CHGNN** — semi-supervised; it is excluded from the default unsupervised comparison and must be enabled explicitly with `--include-chgnn`.
-
 The benchmark also evaluates the learned representations with:
 
 ### Structure-free classifiers
