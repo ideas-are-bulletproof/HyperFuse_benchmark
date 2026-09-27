@@ -321,7 +321,6 @@ Method-specific hyperparameters remain inside the corresponding method adapters 
 
 ## Notes
 
-- CHGNN is semi-supervised and is therefore not part of the default unsupervised comparison.
 - Dataset files are not redistributed with this repository.
 - Vendored code is retained under `vendor/` for reproducibility of the benchmark.
 - Please check the licenses and citation requirements of the original methods before redistribution or reuse.
