@@ -1,8 +1,8 @@
 """
-HyperFuse  (Eureka utility + hypergraph CCA self-supervision)  -- single file.
+HyperFuse -- self-supervised node embeddings for hypergraphs (single file).
 
 Self-contained: numpy + scipy for stages A/B, torch for stage C.
-No imports from the benchmark repo (fuse_core, hgb).
+No imports from the benchmark harness.
 
     from fuse_versions.HyperFuse import embed
     Z = embed(hyperedges, X, num_nodes=N, seed=0, device="cuda")
@@ -19,15 +19,18 @@ A  Structure.  Banerjee's hypergraph adjacency A = H W H^T - diag(H W 1) and
 B  Features.  X residualised against S, two corrupted views (feature masking /
    membership masking), three propagation scales, agreement-gated and
    SVD-reduced to F (emb_dim/2); G (emb_dim/4) = top singular vectors of the
-   normalised incidence.  Eureka utility: 13 descriptors per hyperedge ->
-   ridge -> hyperedge weights w_e in [0.65, 1.35], mean 1.
-C  Self-supervision (replaces SAGE).  Hypergraph CCA:
+   normalised incidence.  Hyperedge weights: a label-free stability score per
+   hyperedge (how stable its members' propagated features are under the two
+   corruptions, relative to a random group of the same size), smoothed by a
+   ridge regression on 13 hyperedge descriptors -> weights w_e in
+   [0.65, 1.35], mean 1.
+C  Self-supervision.  Hypergraph CCA:
      * two views per epoch, built from the SAME two corruptions as stage B:
-       feature masking of the raw features (only when they are sparse; dense
-       continuous descriptors are left intact) and membership masking of the
-       incidence (each node-hyperedge entry dropped independently);
+       feature masking of the raw features (skipped for dense real-valued
+       descriptors) and membership masking of the incidence (each
+       node-hyperedge entry dropped independently);
      * a 2-layer hypergraph encoder whose hyperedge->node step is the
-       utility-weighted mean (so the Eureka weights shape every message),
+       w_e-weighted mean (so the hyperedge weights shape every message),
        reading the raw (sparse) features plus the stage-B summary [F | G],
        followed by `hops` parameter-free lazy propagation steps (SSGC-style
        average);
@@ -37,18 +40,13 @@ C  Self-supervision (replaces SAGE).  Hypergraph CCA:
        network, O(N d^2) per epoch.
    The encoder's output layer produces exactly emb_dim columns.
 
-Dimensions -- nothing is ever zero-padded
-------------------------------------------
+Dimensions
+----------
 S, F, G default to emb_dim/4, emb_dim/2, emb_dim/4 (32/64/32 for 128).  They
-are internal signals (residualisation, utility descriptors, encoder input);
+are internal signals (residualisation, hyperedge descriptors, encoder input);
 if the data cannot fill a block (e.g. fewer features than the block width) the
 block is simply narrower.  The output width is set by a learned linear layer,
 so it is always exactly emb_dim.
-
-Why not SAGE: the skip-gram/negative-sampling objective could not use the raw
-features (feeding them in made it worse), so it had to work from the 88-d
-compressed [F | G], zero-padded to 128.  The CCA objective uses the raw
-features directly, and in our runs this is where the accuracy gain comes from.
 """
 from __future__ import annotations
 
@@ -73,8 +71,11 @@ DEFAULTS = dict(
     # stage B
     mask_rate=0.10, temperature=0.25, min_scale_weight=0.05, beta=0.5,
     lazy_alpha=0.5, ssgc_hops=3, normalize_raw_features=True, center_residual=True,
-    # eureka utility
-    utility="ridge",                      # ridge | target | uniform
+    # hyperedge weights
+    utility="uniform",                    # uniform (the method) | ridge | target (ablations only)
+    util_w_stab=0.65, util_w_cross=0.35,  # r_j = w_stab*mean(sigma) + w_cross*mean(kappa)
+    util_w_sd=0.20,                       #       - w_sd*sd(sigma)
+    util_null_sets=3,                     # random size-matched node sets for r_j^0
     utility_epochs=160, utility_lr=0.03, utility_l2=5e-2, utility_temp=0.8,
     weight_min=0.65, weight_max=1.35,
     # stage C (hypergraph CCA)
@@ -337,7 +338,7 @@ def modularity_ascent(M, dim, iters, seed, eta=None, tol=1e-5, patience=5,
     return Z
 
 
-# ---- Eureka: hyperedge descriptors, targets, utility weights --------------- #
+# ---- hyperedge weights: descriptors, stability targets, weights ----------- #
 def _rownorm(Z):
     Z = np.asarray(Z, dtype=np.float64)
     return Z / np.maximum(np.linalg.norm(Z, axis=1, keepdims=True), 1e-12)
@@ -408,7 +409,8 @@ def _rank01(x):
     return np.ones_like(x) * 0.5 if x.size == 1 else r / (x.size - 1)
 
 
-def edge_aug_targets(H, X, R, seed, rate, alpha, K, HB=None):
+def edge_aug_targets(H, X, R, seed, rate, alpha, K, HB=None,
+                     w_stab=0.65, w_cross=0.35, w_sd=0.20, n_null=3):
     """How stable each hyperedge's members are under feature and membership
     masking, minus a size-matched random baseline, rank-normalised to [0,1]."""
     X = np.asarray(X, dtype=np.float64)
@@ -429,17 +431,17 @@ def edge_aug_targets(H, X, R, seed, rate, alpha, K, HB=None):
                        shape=Hc.shape)
     local, disp = _edge_moments(B_, cnt.astype(float), node_stab)
     cross, _ = _edge_moments(B_, cnt.astype(float), node_cross)
-    raw = (0.65 * local + 0.35 * cross - 0.20 * disp)[valid]
+    raw = (w_stab * local + w_cross * cross - w_sd * disp)[valid]
 
     n = X.shape[0]
     rng = np.random.default_rng(seed + 271828)
     null = np.empty(len(valid))
     for t, size in enumerate(cnt[valid]):
         vals = []
-        for _ in range(3):
+        for _ in range(int(n_null)):
             idx = rng.choice(n, size=min(int(size), n), replace=False)
-            vals.append(0.65 * float(np.mean(node_stab[idx]))
-                        + 0.35 * float(np.mean(node_cross[idx])))
+            vals.append(w_stab * float(np.mean(node_stab[idx]))
+                        + w_cross * float(np.mean(node_cross[idx])))
         null[t] = float(np.mean(vals))
     return np.clip(_rank01(raw - null), 0.0, 1.0)
 
@@ -551,13 +553,18 @@ def stage_ab(hyperedges, X, num_nodes=None, seed=0, cfg=None, logger=LOG):
     G = _incidence_svd(R, dg, sd + 15485863, logger=logger)
     tm["features_s"] = time.perf_counter() - t0
 
-    # ---- B: Eureka utility ----
+    # ---- B: hyperedge weights ----
     t0 = time.perf_counter()
-    desc, valid = hyperedge_descriptors(H, S, F, G, Cg, nd)
-    targets = (np.zeros(len(valid)) if str(c["utility"]) == "uniform"
-               else edge_aug_targets(H, X, R, sd, rate, alpha, K, HB=HB))
-    u_valid, uinfo = utility_weights(desc, targets, c, sd + 314159)
-    w = np.ones(H.shape[1]); w[valid] = u_valid
+    w, uinfo = np.ones(H.shape[1]), {}
+    if str(c["utility"]) != "uniform":          # reliability weights: ablations only
+        desc, valid = hyperedge_descriptors(H, S, F, G, Cg, nd)
+        targets = edge_aug_targets(H, X, R, sd, rate, alpha, K, HB=HB,
+                                   w_stab=float(c["util_w_stab"]),
+                                   w_cross=float(c["util_w_cross"]),
+                                   w_sd=float(c["util_w_sd"]),
+                                   n_null=int(c["util_null_sets"]))
+        u_valid, uinfo = utility_weights(desc, targets, c, sd + 314159)
+        w[valid] = u_valid
     tm["utility_s"] = time.perf_counter() - t0
     logger.info(f"  [hyperfuse] S={S.shape[1]} F={F.shape[1]} G={G.shape[1]} | utility {c['utility']} "
                 f"min={w.min():.3f} max={w.max():.3f} "
@@ -843,7 +850,7 @@ def embed(hyperedges, X, num_nodes=None, seed=0, device="cpu", logger=None,
 
 
 def feats_hyperfuse(d, meta=None, seed=None, device="cpu", logger=None, **overrides):
-    """Old fuse_versions interface: d = {'hyperedges', 'x', 'num_nodes', ...}."""
+    """Dict-based interface: d = {'hyperedges', 'x', 'num_nodes', ...}."""
     return embed(d["hyperedges"], d["x"], num_nodes=int(d["num_nodes"]),
                  seed=0 if seed is None else int(seed), device=device, logger=logger, **overrides)
 
